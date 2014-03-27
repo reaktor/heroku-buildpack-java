@@ -3,6 +3,8 @@
 
 # fail fast
 set -e
+# don't ignore exit codes when piping output
+set -o pipefail
 
 logger -p user.notice -t "slugc[$$]" "language_pack_java java_compile_start"
 
@@ -14,6 +16,17 @@ CACHE_DIR=$2
 ENV_DIR=$3
 
 LOGGER_FLAGS=""
+
+# sed -l basically makes sed replace and buffer through stdin to stdout
+# so you get updates while the command runs and dont wait for the end
+# e.g. npm install | indent
+indent() {
+  c='s/^/       /'
+  case $(uname) in
+    Darwin) sed -l "$c";; # mac/bsd sed: -l buffers on line boundaries
+    *)      sed -u "$c";; # unix/gnu sed: -u unbuffered (arbitrary) chunks of data
+  esac
+}
 
 curl --silent --location http://heroku-jvm-common.s3.amazonaws.com/jvm-buildpack-common.tar.gz | tar xz
 . bin/util
@@ -102,5 +115,91 @@ PROFILE_PATH="$BUILD_DIR/.profile.d/java.sh"
 mkdir -p $(dirname $PROFILE_PATH)
 echo 'export PATH="/app/.jdk/bin:$PATH"' >> $PROFILE_PATH
 echo 'export JAVA_TOOL_OPTIONS="$JAVA_TOOL_OPTIONS -Djava.rmi.server.useCodebaseOnly=true"' >> $PROFILE_PATH
+
+# install node.js
+node_version=$(curl --silent --get --data-urlencode "range=0.10.x" https://semver.io/node/resolve)
+echo -n "-----> Installing node.js ${node_version}..."
+node_url="http://s3pository.heroku.com/node/v$node_version/node-v$node_version-linux-x64.tar.gz"
+curl $node_url -s -o - | tar xzf - -C $BUILD_DIR
+echo " done"
+
+GLOBAL_NPM_MODULES=(bower grunt-cli)
+
+# move node (and npm) into ./vendor and make them executable
+mkdir -p $BUILD_DIR/vendor
+mv $BUILD_DIR/node-v$node_version-linux-x64 $BUILD_DIR/vendor/node
+chmod +x $BUILD_DIR/vendor/node/bin/*
+PATH=$PATH:$BUILD_DIR/vendor/node/bin
+
+if [ -d $CACHE_DIR/grunt/node_modules ]; then
+  echo "-----> Restoring node_modules directory from cache"
+  cp -r $CACHE_DIR/grunt/node_modules $BUILD_DIR/
+
+  echo "-----> Pruning cached dependencies not specified in package.json"
+  npm prune 2>&1 | indent
+
+  if [ ! -f $CACHE_DIR/grunt/node-version ] || [ $(< $CACHE_DIR/grunt/node-version) != "$node_version" ]; then
+    echo "-----> Node version changed since last build; rebuilding dependencies"
+    npm rebuild 2>&1 | indent
+  fi
+fi
+
+echo "-----> Installing npm dependencies"
+npm install 2>&1 | indent
+
+# restore global npm modules from cache
+if [ -f $CACHE_DIR/grunt/node-version ] && [ $(< $CACHE_DIR/grunt/node-version) == "$node_version" ]; then
+  for npm in ${GLOBAL_NPM_MODULES[*]}; do
+    if [ -d $CACHE_DIR/grunt/global_node_modules/$npm ]; then
+      echo "-----> Restoring $npm from cache"
+      cp -r $CACHE_DIR/grunt/global_node_modules/$npm $BUILD_DIR/vendor/node/lib/node_modules/
+      # symlink executables
+      (
+        cd $BUILD_DIR/vendor/node/bin
+        find ../lib/node_modules/$npm/bin -type f | xargs -r ln -sf -t .
+      )
+    fi
+  done
+fi
+
+for npm in ${GLOBAL_NPM_MODULES[*]}; do
+  if [ ! -d $BUILD_DIR/vendor/node/lib/node_modules/$npm ]; then
+    echo "-----> Installing $npm"
+    npm install -g $npm 2>&1 | indent
+  fi
+done
+
+if [ -d $CACHE_DIR/grunt/bower_components ]; then
+  echo "-----> Restoring bower_components directory from cache"
+  cp -r $CACHE_DIR/grunt/bower_components $BUILD_DIR/app/components
+fi
+
+echo "-----> Installing bower packages"
+bower install --config.interactive=false --production 2>&1 | indent
+
+echo "-----> Running grunt build"
+grunt build 2>&1 | indent
+
+# purge old cache
+rm -rf $CACHE_DIR/grunt
+mkdir -p $CACHE_DIR/grunt
+
+echo "-----> Caching node and bower directories"
+if [ -d $BUILD_DIR/node_modules ]; then
+  cp -r $BUILD_DIR/node_modules $CACHE_DIR/grunt/
+fi
+if [ -d $BUILD_DIR/app/components ]; then
+  cp -r $BUILD_DIR/app/components $CACHE_DIR/grunt/bower_components
+fi
+
+mkdir -p $CACHE_DIR/grunt/global_node_modules
+for npm in ${GLOBAL_NPM_MODULES[*]}; do
+  if [ -d $BUILD_DIR/vendor/node/lib/node_modules/$npm ]; then
+    cp -r $BUILD_DIR/vendor/node/lib/node_modules/$npm $CACHE_DIR/grunt/global_node_modules/
+  fi
+done
+
+# save node version for later reference
+echo $node_version > $CACHE_DIR/grunt/node-version
 
 logger -p user.notice -t "slugc[$$]" "language_pack_java java_compile_end $LOGGER_FLAGS"
