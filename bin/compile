@@ -145,7 +145,6 @@ if [ -d $CACHE_DIR/grunt/node_modules ]; then
 fi
 
 echo "-----> Installing bower 1.3.9"
-npm uninstall bower -g
 npm install -g bower@1.3.9
 
 echo "-----> Installing npm dependencies"
